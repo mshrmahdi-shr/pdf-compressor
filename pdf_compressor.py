@@ -48,13 +48,35 @@ bytes raw, then sets /Filter manually, deletes /DecodeParms (because
 pikepdf's read_bytes() already returns predictor-decoded data), and saves
 with ``recompress_flate=False`` so the optimized bytes survive to disk.
 
+Two safety rules added in the November 2026 update, learned from a batch of
+legal/land documents:
+
+- An image is replaced only when the new bytes are strictly smaller than
+  the original stored bytes. Tiny template graphics (seals, banners, logos)
+  that would grow as JPEG are left untouched.
+- A 1-bit black-and-white scan is never converted to JPEG. It is downscaled,
+  thresholded back to 1-bit, and re-saved as Flate, with its /Decode
+  preserved — and the threshold is flipped when the original /Decode is
+  inverted ([1 0], the usual scanner convention), otherwise the whole page
+  renders inverted. This keeps survey linework sharp instead of JPEG-blurred.
+- The output is never bigger than the input: if compression would grow a
+  file, the original is copied to the output path instead, and the result
+  reports 0% reduction for that file.
+
 Usage
 -----
     python pdf_compressor.py input.pdf output.pdf
     python pdf_compressor.py input.pdf output.pdf --compression-percent 50
     python pdf_compressor.py input.pdf output.pdf --no-image-downscale
     python pdf_compressor.py input.pdf output.pdf --image-scale 0.4 --image-quality 40
-    python pdf_compressor_gui.py   # graphical version with a slider
+    python pdf_compressor.py file1.pdf file2.pdf file3.pdf --zip compressed.zip --compression-percent 50
+    python pdf_compressor_gui.py   # graphical version with a slider (one file at a time)
+
+Batch mode (--zip): each input becomes <name>_compressed.pdf inside the
+zip (duplicate basenames get _1, _2 suffixes). Files that cannot be
+shrunk are included unchanged, never larger. The GUI compresses one file
+at a time; batch mode is command-line only, but the GUI shares the same
+compress_file(), so it benefits from the same safety rules.
 
 Requirements: pikepdf, Pillow, zopfli  (see requirements.txt)
 The GUI additionally needs tkinter (included with most Python installs;
@@ -64,7 +86,10 @@ on Debian/Ubuntu: sudo apt install python3-tk).
 import argparse
 import io
 import os
+import shutil
 import sys
+import tempfile
+import zipfile
 
 import pikepdf
 from PIL import Image
@@ -90,7 +115,26 @@ def compression_percent_to_settings(percent):
 
 
 def downscale_images(pdf, scale=0.5, quality=50, min_pixels=50000, verbose=True):
-    """Halve large raster images in place. Returns (count, bytes_saved)."""
+    """Downscale large raster images in place. Returns (count, bytes_saved).
+
+    Safety rules (November 2026 update):
+
+    - An image is replaced only when the new bytes are strictly smaller
+      than the original stored bytes. Tiny template graphics (seals,
+      banners, logos) that would grow as JPEG are left untouched.
+    - A 1-bit black-and-white scan is never converted to JPEG. It is
+      downscaled, thresholded back to 1-bit, and re-saved as Flate, with
+      its /Decode preserved. The threshold is flipped when the original
+      /Decode is inverted ([1 0], the usual scanner convention), because
+      Pillow's "1" packing maps white -> sample 1 while such PDFs use
+      sample 1 = black ink; writing Pillow bits unchanged would invert
+      the whole page. Thresholding uses dither=NONE so no dither noise
+      is added to already-thresholded linework.
+    - CMYK images are left untouched: JPEG CMYK handling risks colour
+      inversion in PDF readers, and such images are rare here.
+    - Transparency masks (/SMask) follow the same smaller-check rule.
+    - Image masks (/ImageMask) are left untouched.
+    """
     seen = set()
     saved = 0
     count = 0
@@ -113,6 +157,8 @@ def downscale_images(pdf, scale=0.5, quality=50, min_pixels=50000, verbose=True)
                 seen.add(objgen)
                 if obj.get("/Subtype") != "/Image":
                     continue
+                if obj.get("/ImageMask", False):
+                    continue
                 try:
                     width = int(obj.get("/Width"))
                     height = int(obj.get("/Height"))
@@ -121,67 +167,135 @@ def downscale_images(pdf, scale=0.5, quality=50, min_pixels=50000, verbose=True)
                 if width * height < min_pixels:
                     continue
                 try:
+                    bits = int(obj.get("/BitsPerComponent", 8))
+                except Exception:
+                    bits = 8
+                try:
+                    old_len = len(obj.get_raw_stream_buffer())
                     image = pikepdf.PdfImage(obj)
                     pil_image = image.as_pil_image()
                     new_w = max(1, int(width * scale))
                     new_h = max(1, int(height * scale))
-                    if pil_image.mode in ("RGBA", "LA", "P"):
-                        pil_image = pil_image.convert("RGB")
-                    resized = pil_image.resize((new_w, new_h), Image.LANCZOS)
-                    buf = io.BytesIO()
-                    resized.save(buf, format="JPEG", quality=quality, optimize=True)
-                    new_data = buf.getvalue()
-                    old_len = len(obj.get_raw_stream_buffer())
-
-                    # Write JPEG bytes raw and set /Filter manually, so pikepdf
-                    # does not recompress them with its own JPEG encoder.
-                    obj.write(new_data, filter=None)
-                    obj["/Filter"] = pikepdf.Name("/DCTDecode")
-                    obj["/Width"] = new_w
-                    obj["/Height"] = new_h
-                    if "/DecodeParms" in obj:
-                        del obj["/DecodeParms"]
-
-                    # Same treatment for the transparency mask, if any.
-                    smask = obj.get("/SMask", None)
-                    if smask is not None:
+                    if bits == 1:
+                        # 1-bit scan: keep it 1-bit sharp, never JPEG.
+                        decode = obj.get("/Decode", None)
+                        inverted_decode = False
                         try:
-                            sw = int(smask.get("/Width"))
-                            sh = int(smask.get("/Height"))
-                            smask_image = pikepdf.PdfImage(smask)
-                            smask_pil = smask_image.as_pil_image()
-                            if smask_pil.mode != "L":
-                                smask_pil = smask_pil.convert("L")
-                            new_sw = max(1, int(sw * scale))
-                            new_sh = max(1, int(sh * scale))
-                            smask_resized = smask_pil.resize(
-                                (new_sw, new_sh), Image.LANCZOS
-                            )
-                            sbuf = io.BytesIO()
-                            smask_resized.save(
-                                sbuf, format="JPEG", quality=quality, optimize=True
-                            )
-                            smask_data = sbuf.getvalue()
-                            smask_old = len(smask.get_raw_stream_buffer())
-                            smask.write(smask_data, filter=None)
-                            smask["/Filter"] = pikepdf.Name("/DCTDecode")
-                            smask["/Width"] = new_sw
-                            smask["/Height"] = new_sh
-                            if "/DecodeParms" in smask:
-                                del smask["/DecodeParms"]
-                            saved += smask_old - len(smask_data)
-                        except Exception as exc:  # keep going if a mask fails
+                            if decode is not None and len(decode) >= 2:
+                                if float(decode[0]) > float(decode[1]):
+                                    inverted_decode = True
+                        except Exception:
+                            inverted_decode = False
+                        if pil_image.mode != "L":
+                            pil_image = pil_image.convert("L")
+                        resized = pil_image.resize((new_w, new_h), Image.LANCZOS)
+                        if inverted_decode:
+                            bw = resized.point(
+                                lambda p: 0 if p > 128 else 255
+                            ).convert("1", dither=Image.NONE)
+                        else:
+                            bw = resized.point(
+                                lambda p: 255 if p > 128 else 0
+                            ).convert("1", dither=Image.NONE)
+                        packed = bw.tobytes()
+                        new_data = zopfli.zlib.compress(packed, numiterations=5)
+                        if len(new_data) >= old_len:
                             if verbose:
-                                print(f"  SMask error: {exc}", flush=True)
+                                print(
+                                    f"  1-bit {width}x{height} -> {new_w}x{new_h}: "
+                                    f"new {len(new_data)} >= old {old_len}, "
+                                    "kept original",
+                                    flush=True,
+                                )
+                            continue
+                        obj.write(new_data, filter=None)
+                        obj["/Filter"] = pikepdf.Name("/FlateDecode")
+                        obj["/Width"] = new_w
+                        obj["/Height"] = new_h
+                        if "/DecodeParms" in obj:
+                            del obj["/DecodeParms"]
+                        saved += old_len - len(new_data)
+                        count += 1
+                        if verbose:
+                            print(
+                                f"  1-bit {width}x{height} -> {new_w}x{new_h}, "
+                                f"saved {old_len - len(new_data)}",
+                                flush=True,
+                            )
+                    else:
+                        if pil_image.mode == "CMYK":
+                            if verbose:
+                                print(
+                                    "  Skip CMYK image (colour safety)",
+                                    flush=True,
+                                )
+                            continue
+                        if pil_image.mode in ("RGBA", "LA", "P"):
+                            pil_image = pil_image.convert("RGB")
+                        resized = pil_image.resize((new_w, new_h), Image.LANCZOS)
+                        buf = io.BytesIO()
+                        resized.save(buf, format="JPEG", quality=quality, optimize=True)
+                        new_data = buf.getvalue()
+                        if len(new_data) >= old_len:
+                            if verbose:
+                                print(
+                                    f"  Image {width}x{height} -> {new_w}x{new_h}: "
+                                    f"new {len(new_data)} >= old {old_len}, "
+                                    "kept original",
+                                    flush=True,
+                                )
+                            continue
+                        # Write JPEG bytes raw and set /Filter manually, so pikepdf
+                        # does not recompress them with its own JPEG encoder.
+                        obj.write(new_data, filter=None)
+                        obj["/Filter"] = pikepdf.Name("/DCTDecode")
+                        obj["/Width"] = new_w
+                        obj["/Height"] = new_h
+                        if "/DecodeParms" in obj:
+                            del obj["/DecodeParms"]
 
-                    saved += old_len - len(new_data)
-                    count += 1
-                    if verbose:
-                        print(
-                            f"  Image {width}x{height} -> {new_w}x{new_h}, "
-                            f"saved {old_len - len(new_data)}",
-                            flush=True,
-                        )
+                        # Same smaller-check treatment for the transparency
+                        # mask, if any.
+                        smask = obj.get("/SMask", None)
+                        if smask is not None:
+                            try:
+                                sw = int(smask.get("/Width"))
+                                sh = int(smask.get("/Height"))
+                                smask_image = pikepdf.PdfImage(smask)
+                                smask_pil = smask_image.as_pil_image()
+                                if smask_pil.mode != "L":
+                                    smask_pil = smask_pil.convert("L")
+                                new_sw = max(1, int(sw * scale))
+                                new_sh = max(1, int(sh * scale))
+                                smask_resized = smask_pil.resize(
+                                    (new_sw, new_sh), Image.LANCZOS
+                                )
+                                sbuf = io.BytesIO()
+                                smask_resized.save(
+                                    sbuf, format="JPEG", quality=quality, optimize=True
+                                )
+                                smask_data = sbuf.getvalue()
+                                smask_old = len(smask.get_raw_stream_buffer())
+                                if len(smask_data) < smask_old:
+                                    smask.write(smask_data, filter=None)
+                                    smask["/Filter"] = pikepdf.Name("/DCTDecode")
+                                    smask["/Width"] = new_sw
+                                    smask["/Height"] = new_sh
+                                    if "/DecodeParms" in smask:
+                                        del smask["/DecodeParms"]
+                                    saved += smask_old - len(smask_data)
+                            except Exception as exc:  # keep going if a mask fails
+                                if verbose:
+                                    print(f"  SMask error: {exc}", flush=True)
+
+                        saved += old_len - len(new_data)
+                        count += 1
+                        if verbose:
+                            print(
+                                f"  Image {width}x{height} -> {new_w}x{new_h}, "
+                                f"saved {old_len - len(new_data)}",
+                                flush=True,
+                            )
                 except Exception as exc:
                     if verbose:
                         print(f"  Image error: {exc}", flush=True)
@@ -278,6 +392,9 @@ def compress_file(
     Raises FileNotFoundError / ValueError for bad inputs, and propagates
     pikepdf errors. On success, output_path exists and page counts match
     (checked by the caller via verify_page_count if desired).
+    The output is never bigger than the input: if compression would grow
+    the file, the original is copied to output_path instead and the
+    returned dict has kept_original=True with 0% reduction.
     """
     if not os.path.isfile(input_path):
         raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -285,11 +402,7 @@ def compress_file(
         raise ValueError("Output must be a different file from input.")
 
     original_size = os.path.getsize(input_path)
-    print(
-        f"Original: {original_size} bytes, target for -20%: "
-        f"{int(original_size * 0.8)} bytes",
-        flush=True,
-    )
+    print(f"Original: {original_size} bytes", flush=True)
 
     pdf = pikepdf.open(input_path)
 
@@ -338,6 +451,18 @@ def compress_file(
     pdf.close()
 
     new_size = os.path.getsize(output_path)
+    # Never-bigger fallback: if compression grew the file, return the
+    # original instead. The caller (and the batch summary) then reports
+    # 0% reduction for this file, never a negative one.
+    kept_original = False
+    if new_size >= original_size:
+        shutil.copyfile(input_path, output_path)
+        new_size = original_size
+        kept_original = True
+        print(
+            "Kept original (compressed version was not smaller)",
+            flush=True,
+        )
     reduction = (1 - new_size / original_size) * 100 if original_size else 0
     print(f"Done! Output: {output_path}", flush=True)
     print(f"Original: {original_size} bytes", flush=True)
@@ -363,16 +488,167 @@ def compress_file(
         "image_saved": saved,
         "stream_count": stream_count,
         "zopfli_saved": zopfli_saved,
+        "kept_original": kept_original,
+    }
+
+
+def compress_batch(
+    input_paths,
+    zip_path,
+    image_scale=0.5,
+    image_quality=50,
+    min_image_pixels=50000,
+    downscale_enabled=True,
+    keep_vp=False,
+    zopfli_iterations=5,
+    verbose=True,
+):
+    """Compress several PDFs and pack the results into one zip file.
+
+    Each input becomes <basename>_compressed.pdf inside the zip
+    (duplicate basenames get _1, _2 suffixes so extraction never
+    overwrites a sibling). Files are processed one by one, in order,
+    with the same settings; a file that fails (missing, unreadable, or
+    page-count mismatch after compression) is skipped and recorded in
+    "failures", while the other files still go into the zip. Files
+    that cannot be shrunk are included unchanged (never-bigger
+    fallback in compress_file, reported with kept_original=True).
+
+    Returns a dict with per-file stats ("files"), "failures",
+    totals, and "zip_size" (0 and zip_path=None when no file
+    succeeded, in which case no zip is written).
+    """
+    if not input_paths:
+        raise ValueError("No input files given for batch mode.")
+
+    # Deduplicate output names inside the zip.
+    used_names = set()
+    planned = []
+    for input_path in input_paths:
+        base = os.path.splitext(os.path.basename(input_path))[0]
+        output_name = base + "_compressed.pdf"
+        if output_name in used_names:
+            stem = base + "_compressed"
+            i = 1
+            while f"{stem}_{i}.pdf" in used_names:
+                i += 1
+            output_name = f"{stem}_{i}.pdf"
+        used_names.add(output_name)
+        planned.append((input_path, output_name))
+
+    results = []
+    failures = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_files = []
+        for input_path, output_name in planned:
+            temp_path = os.path.join(tmpdir, output_name)
+            try:
+                stats = compress_file(
+                    input_path,
+                    temp_path,
+                    image_scale=image_scale,
+                    image_quality=image_quality,
+                    min_image_pixels=min_image_pixels,
+                    downscale_enabled=downscale_enabled,
+                    keep_vp=keep_vp,
+                    zopfli_iterations=zopfli_iterations,
+                    verbose=verbose,
+                )
+            except Exception as exc:
+                print(f"Error compressing {input_path}: {exc}", flush=True)
+                failures.append({"input": input_path, "error": str(exc)})
+                continue
+            if stats["in_pages"] != stats["out_pages"]:
+                print(
+                    f"Error compressing {input_path}: page count mismatch "
+                    f"{stats['in_pages']} -> {stats['out_pages']}, "
+                    "skipped from zip",
+                    flush=True,
+                )
+                failures.append(
+                    {
+                        "input": input_path,
+                        "error": (
+                            f"Page count mismatch "
+                            f"{stats['in_pages']} -> {stats['out_pages']}"
+                        ),
+                    }
+                )
+                continue
+            stats = dict(stats)
+            stats["input"] = input_path
+            stats["output_name"] = output_name
+            results.append(stats)
+            temp_files.append((output_name, temp_path))
+            print(
+                f"RESULT {input_path}: {stats['original_size']} -> "
+                f"{stats['new_size']} ({stats['reduction_percent']:.2f}%), "
+                f"pages {stats['in_pages']} -> {stats['out_pages']}, "
+                f"kept_original={stats['kept_original']}",
+                flush=True,
+            )
+        zip_size = 0
+        if temp_files:
+            with zipfile.ZipFile(
+                zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+            ) as zf:
+                for output_name, temp_path in temp_files:
+                    zf.write(temp_path, arcname=output_name)
+            zip_size = os.path.getsize(zip_path)
+
+    total_original = sum(r["original_size"] for r in results)
+    total_new = sum(r["new_size"] for r in results)
+    total_reduction = (
+        (1 - total_new / total_original) * 100 if total_original else 0
+    )
+    print(
+        f"Batch total: {total_original} -> {total_new} "
+        f"({total_reduction:.2f}%)",
+        flush=True,
+    )
+    if temp_files:
+        print(
+            f"Zip: {zip_path} ({zip_size} bytes, {len(temp_files)} files)",
+            flush=True,
+        )
+    else:
+        print("No files compressed; no zip written.", flush=True)
+    if failures:
+        print(f"Failures: {len(failures)} file(s) failed (see above).", flush=True)
+
+    return {
+        "files": results,
+        "failures": failures,
+        "total_original": total_original,
+        "total_new": total_new,
+        "total_saved": total_original - total_new,
+        "total_reduction_percent": total_reduction,
+        "zip_path": zip_path if temp_files else None,
+        "zip_size": zip_size,
     }
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Shrink an already-optimized PDF with Zopfli recompression "
-        "and optional image downscaling."
+        "and optional image downscaling. Use --zip for batch mode."
     )
-    parser.add_argument("input", help="Input PDF file")
-    parser.add_argument("output", help="Output PDF file")
+    parser.add_argument(
+        "inputs",
+        nargs="+",
+        help="Input PDF file(s). Single-file mode: input.pdf output.pdf. "
+        "Batch mode: input1.pdf input2.pdf ... plus --zip out.zip "
+        "(with --zip, every positional is treated as an input PDF).",
+    )
+    parser.add_argument(
+        "--zip",
+        dest="zip_path",
+        type=str,
+        default=None,
+        help="Batch mode: write all compressed PDFs into this zip file "
+        "(e.g. compressed.zip). Give only input PDFs positionally, "
+        "no output PDF.",
+    )
     parser.add_argument(
         "--compression-percent",
         type=int,
@@ -439,10 +715,46 @@ def main(argv=None):
             flush=True,
         )
 
+    # Batch mode: with --zip, every positional is an input PDF.
+    if args.zip_path is not None:
+        try:
+            batch = compress_batch(
+                args.inputs,
+                args.zip_path,
+                image_scale=image_scale,
+                image_quality=image_quality,
+                min_image_pixels=args.min_image_pixels,
+                downscale_enabled=downscale_enabled,
+                keep_vp=args.keep_vp,
+                zopfli_iterations=args.zopfli_iterations,
+                verbose=verbose,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        return 2 if batch["failures"] else 0
+
+    # Single-file mode: exactly two positionals (input, output).
+    if len(args.inputs) != 2:
+        if len(args.inputs) < 2:
+            print(
+                "Error: missing output PDF. Give input.pdf output.pdf, "
+                "or use --zip for batch mode.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Error: single-file mode takes exactly one input PDF "
+                "and one output PDF. Give multiple inputs only with --zip.",
+                file=sys.stderr,
+            )
+        return 2
+    input_path, output_path = args.inputs
+
     try:
         stats = compress_file(
-            args.input,
-            args.output,
+            input_path,
+            output_path,
             image_scale=image_scale,
             image_quality=image_quality,
             min_image_pixels=args.min_image_pixels,

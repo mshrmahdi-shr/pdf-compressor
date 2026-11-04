@@ -12,6 +12,11 @@ not smaller. This tool goes one step further.
    Large map/photo images are halved in resolution (0.5× by default) and
    re-saved as JPEG quality 50. They keep the same display size on the page
    but are slightly less sharp when zoomed far in. Small icons are left alone.
+   An image is replaced only when the new bytes are strictly smaller than
+   the original stored bytes, so tiny template graphics (seals, banners,
+   logos) that would grow as JPEG stay untouched. A 1-bit black-and-white
+   scan is never converted to JPEG: it is downscaled, thresholded back to
+   1-bit, and re-saved as Flate, so survey linework stays sharp.
    Use `--no-image-downscale` for a fully lossless run.
 
 2. **Recompresses every Flate stream with Zopfli.**
@@ -23,6 +28,10 @@ not smaller. This tool goes one step further.
 3. **Removes non-visible data.**
    Measurement viewports (`/VP`) and `/LastModified` stamps are removed from
    pages. They do not affect appearance, text, or print output.
+
+4. **Never returns a bigger file.**
+   If compression would grow a file, the original is copied to the output
+   path instead, and the result reports 0% reduction for that file.
 
 ## Graphical version (with a slider)
 
@@ -56,6 +65,11 @@ Debian/Ubuntu: `sudo apt install python3-tk`). Compression runs in a
 background thread so the window stays responsive; detailed progress goes
 to the console.
 
+The GUI compresses one file at a time; for several files into a zip, use
+the command-line batch mode below. The GUI shares the same `compress_file()`,
+so single-file runs benefit from the same smaller-check, 1-bit, and
+never-bigger rules.
+
 ## Installation
 
 ```bash
@@ -88,9 +102,24 @@ python pdf_compressor.py input.pdf output.pdf --image-scale 0.4 --image-quality 
 python pdf_compressor.py input.pdf output.pdf --keep-vp
 ```
 
+```bash
+# Batch: several PDFs into one zip (balanced 50% setting)
+python pdf_compressor.py file1.pdf file2.pdf file3.pdf --zip compressed.zip --compression-percent 50
+```
+
+Each input becomes `<name>_compressed.pdf` inside the zip (duplicate
+basenames get `_1`, `_2` suffixes, so extraction never overwrites a
+sibling). When `--zip` is given, every positional argument is treated as
+an input PDF (there is no output PDF positional in batch mode). Files
+that cannot be shrunk are included unchanged, never larger. If a file
+fails, the others still go into the zip and the exit code is 2; if all
+files fail, no zip is written. Batch processes files one by one,
+sequentially.
+
 `--compression-percent` overrides `--image-scale` / `--image-quality`.
 The tool prints the original size, the new size, the percentage reduction,
-and a page-count check (`44 -> 44 OK`).
+and a page-count check (`44 -> 44 OK`). In batch mode it prints a
+one-line result per file, totals, and the zip size.
 
 ## Real results
 
@@ -111,6 +140,27 @@ vector content was already highly compressed. Reaching 20% on a file like
 that would require simplifying the vectors themselves, which risks changing
 the technical drawings.
 
+Batch example (November 2026, 8 legal/land documents, balanced 50% setting):
+
+| File | Pages | Original | Compressed | Reduction |
+|------|------:|--------:|----------:|----------:|
+| PIN 21356-0025 | 2 | 227,736 bytes | 82,057 bytes | **63.97%** |
+| PIN 21356-0026 | 2 | 226,987 bytes | 81,629 bytes | **64.04%** |
+| PIN 21356-0222 | 3 | 262,907 bytes | 88,868 bytes | **66.20%** |
+| RSC Letter | 3 | 234,622 bytes | 176,617 bytes | **24.72%** |
+| AT5800460 | 3 | 121,511 bytes | 54,878 bytes | **54.84%** |
+| AT5968732 | 3 | 117,727 bytes | 53,434 bytes | **54.61%** |
+| AT6463335 | 3 | 122,750 bytes | 54,944 bytes | **55.24%** |
+| Legal Survey | 1 | 1,363,113 bytes | 422,811 bytes | **68.98%** |
+| Total (extracted) | 20 | 2,677,353 bytes | 1,015,238 bytes | **62.08%** |
+
+The zip file itself was 853,957 bytes (68.10% smaller than the originals),
+because zip compression squeezes the remaining uncompressed parts further.
+In all 8 files the extracted text was identical before and after, page
+counts and page sizes were unchanged, and rendered pages were spot-checked
+(including the survey at overview and detail scale, where small text
+stayed legible). The survey is a 1-bit scan kept sharp as Flate, not JPEG.
+
 ## How it works (the tricky part)
 
 Neither PyMuPDF nor pikepdf will preserve hand-compressed stream bytes if you
@@ -122,6 +172,13 @@ So this tool:
 - deletes `/DecodeParms` (pikepdf's `read_bytes()` already returns
   predictor-decoded data, so a viewer must not apply a predictor again),
 - and saves with `recompress_flate=False` so the optimized bytes survive.
+
+Additionally:
+
+- for 1-bit scans, it writes Flate-packed bits (never JPEG) with `/Decode`
+  preserved, flipping the threshold when `/Decode` is inverted (`[1 0]`);
+- it replaces an image only when the new bytes are smaller, and copies the
+  original to the output when the whole file would grow.
 
 ## Limitations
 
@@ -135,7 +192,7 @@ So this tool:
 ## Files
 
 - `pdf_compressor.py` — command-line tool (also importable: `compress_file`,
-  `compression_percent_to_settings`)
+  `compress_batch`, `compression_percent_to_settings`)
 - `pdf_compressor_gui.py` — Tkinter GUI with a compression slider
 - `requirements.txt`, `LICENSE`, `.gitignore`
 
