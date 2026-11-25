@@ -1,3 +1,7 @@
 pikepdf>=9.0
 Pillow>=10.0
 zopfli>=0.2
+# Optional: enables the visual render check in --deep mode (deep mode still
+# works without it — the text check then uses content-stream string tokens
+# and the render check is skipped).
+# PyMuPDF>=1.24

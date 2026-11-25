@@ -19,6 +19,14 @@ reduction depends on the file: a vector-only file with no large images
 maxes out around 17-18% even at 100%, because there is no image left to
 shrink. The result line always shows the real achieved percentage.
 
+Deep mode checkbox (opt-in, off by default): safely shortens numbers in
+vector drawing instructions (coordinates to 1 decimal, colours to 2
+decimals, exact 0.479969 -> 0.48 scale only — see vector_shorten.py),
+then verifies the result (page count, text, render comparison) and falls
+back to the lossless result if verification fails or deep is not smaller.
+Best for vector-heavy engineering PDFs; slow (about twice the lossless
+time); does nothing extra for scanned/image PDFs.
+
 Compression runs in a background thread so the window stays responsive.
 Detailed progress goes to the console; the window shows status and the
 final result. Requires tkinter (included with most Python installs;
@@ -61,7 +69,7 @@ class CompressorGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("PDF Compressor")
-        self.root.minsize(520, 380)
+        self.root.minsize(520, 450)
         self._worker = None
         self._result = None
 
@@ -114,14 +122,29 @@ class CompressorGUI:
             wraplength=480,
         ).grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
 
+        # Deep vector mode checkbox (opt-in, off by default)
+        self.deep_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame,
+            text="Deep vector mode (slower; best for engineering drawings)",
+            variable=self.deep_var,
+        ).grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+        ttk.Label(
+            frame,
+            text="Shortens numbers in vector drawing instructions, then "
+            "verifies the result (text + render) and falls back to the "
+            "lossless result if anything looks wrong. About twice as slow.",
+            wraplength=480,
+        ).grid(row=7, column=0, columnspan=3, sticky=tk.W)
+
         # Compress button + status
         self.compress_button = ttk.Button(
             frame, text="Compress", command=self._start_compression
         )
-        self.compress_button.grid(row=6, column=0, columnspan=3, pady=(16, 0))
+        self.compress_button.grid(row=8, column=0, columnspan=3, pady=(16, 0))
         self.status_var = tk.StringVar(value="Ready.")
         ttk.Label(frame, textvariable=self.status_var, wraplength=480).grid(
-            row=7, column=0, columnspan=3, sticky=tk.W, pady=(8, 0)
+            row=9, column=0, columnspan=3, sticky=tk.W, pady=(8, 0)
         )
 
         frame.columnconfigure(1, weight=1)
@@ -173,10 +196,12 @@ class CompressorGUI:
 
         percent = self.percent_var.get()
         enabled, scale, quality = compression_percent_to_settings(percent)
+        deep = self.deep_var.get()
         self.compress_button.config(state=tk.DISABLED)
         self.status_var.set(
             f"Compressing at {percent}% "
-            f"({'lossless only' if not enabled else f'images {scale}x, JPEG {quality}'})... "
+            f"({'lossless only' if not enabled else f'images {scale}x, JPEG {quality}'})"
+            f"{' + deep vector mode' if deep else ''}... "
             "this can take several minutes on large files. Please wait."
         )
         self._result = None
@@ -189,6 +214,7 @@ class CompressorGUI:
                     image_scale=scale,
                     image_quality=quality,
                     downscale_enabled=enabled,
+                    deep=deep,
                     verbose=False,
                 )
                 self._result = ("ok", stats)
@@ -207,11 +233,20 @@ class CompressorGUI:
             messagebox.showerror("Compression failed", str(payload))
             return
         stats = payload
+        deep_note = ""
+        if stats.get("deep_fallback"):
+            deep_note = (
+                f" Deep mode fell back to lossless "
+                f"({stats['deep_fallback_reason']})."
+            )
+        elif stats.get("deep"):
+            deep_note = " Deep mode verified and kept."
         self.status_var.set(
             f"Done! {stats['original_size']:,} -> {stats['new_size']:,} bytes "
             f"({stats['reduction_percent']:.2f}% smaller, "
             f"saved {stats['saved_bytes']:,} bytes). "
             f"Pages: {stats['in_pages']} -> {stats['out_pages']}."
+            f"{deep_note}"
         )
 
 

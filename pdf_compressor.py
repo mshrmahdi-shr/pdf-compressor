@@ -69,6 +69,7 @@ Usage
     python pdf_compressor.py input.pdf output.pdf --compression-percent 50
     python pdf_compressor.py input.pdf output.pdf --no-image-downscale
     python pdf_compressor.py input.pdf output.pdf --image-scale 0.4 --image-quality 40
+    python pdf_compressor.py input.pdf output.pdf --compression-percent 0 --deep
     python pdf_compressor.py file1.pdf file2.pdf file3.pdf --zip compressed.zip --compression-percent 50
     python pdf_compressor_gui.py   # graphical version with a slider (one file at a time)
 
@@ -78,7 +79,50 @@ shrunk are included unchanged, never larger. The GUI compresses one file
 at a time; batch mode is command-line only, but the GUI shares the same
 compress_file(), so it benefits from the same safety rules.
 
+Deep mode (--deep, opt-in, off by default)
+-------------------------------------------
+For vector-heavy engineering PDFs (CAD exports, cross-sections, foundation
+plans — typically produced by Pdftools and friends) the lossless pass
+leaves money on the table: the drawing instructions carry far more decimal
+places than the drawing needs. Deep mode shortens those numbers before
+Zopfli, using the exact rules proven on a 114-page Phase Two
+cross-sections PDF (11,818,833 -> 9,508,378 bytes, 19.55%, with extracted
+text identical on all 114 pages):
+
+- translations and path coordinates (cm/Tm/Td/TD, m/l/c/v/y/re) to
+  1 decimal place (max shift 0.05 pt = 0.018 mm);
+- colours (rg/RG/g/G/k/K/sc/SC/scn/SCN) to 2 decimals, ROUND_HALF_UP
+  (so 0.995 -> 1);
+- cm/Tm scale/rotation: ONLY the exact value 0.479969 -> 0.48
+  (and -0.479969 -> -0.48). Every other scale/rotation value is left
+  untouched — rounding e.g. 0.479379 -> 0.479 moves far points by ~1 pt
+  because shapes live in a ~0.48-scaled frame with coordinates up to
+  ~3000. A naive "round all decimals to 2dp" changed ~20% of rendered
+  pixels and was rejected;
+- NEVER touch Tc/Tw/Tz/TL/Tf/Ts/TJ/'/" numbers (per-glyph spacing
+  accumulates along a text line);
+- literal strings (...) and hex strings <...> are copied verbatim, so
+  every printed number and table value stays identical;
+- any content stream containing a BI (inline image) operator is left
+  completely untouched.
+
+Because shortening is not risk-free, deep mode verifies itself: it builds
+both a lossless and a deep candidate, then checks the deep candidate
+against the original (page count, page sizes/rotations, extracted text,
+and a render comparison of up to 5 pages at 72 DPI — fails if more than
+8% of pixels differ by >10 levels). The deep result is kept only if
+verification passes AND it is smaller than the lossless result; otherwise
+the lossless result is delivered and the stats report
+deep_fallback=True with the reason. The render check needs PyMuPDF
+(optional dependency); without it the text check falls back to comparing
+content-stream string tokens and the render check is skipped.
+
+Deep mode is slow (about twice the lossless time, because it runs Zopfli
+twice) and only helps vector-heavy PDFs. On scanned/image-heavy PDFs it
+finds nothing to shorten and falls back to the lossless result.
+
 Requirements: pikepdf, Pillow, zopfli  (see requirements.txt)
+PyMuPDF is optional: it enables the render check in --deep mode.
 The GUI additionally needs tkinter (included with most Python installs;
 on Debian/Ubuntu: sudo apt install python3-tk).
 """
@@ -90,10 +134,57 @@ import shutil
 import sys
 import tempfile
 import zipfile
+from collections import Counter
 
-import pikepdf
-from PIL import Image
-import zopfli.zlib
+# ---------------------------------------------------------------------------
+# Dependency check.
+#
+# The natural way to run this tool is `python pdf_compressor.py ...`, but
+# the system python3 on many machines has none of the required packages,
+# and the raw ModuleNotFoundError tells the user nothing useful. So the
+# imports below are guarded: _check_deps() raises a RuntimeError with
+# install instructions instead, and main() prints it cleanly (exit 2).
+# The GUI catches the same error and shows it in a message box.
+# ---------------------------------------------------------------------------
+_MISSING_DEPS = None
+try:
+    import pikepdf
+    from PIL import Image
+    import zopfli.zlib
+except ImportError as _import_error:  # pragma: no cover - missing deps
+    _MISSING_DEPS = _import_error
+    pikepdf = None
+    Image = None
+    zopfli = None
+
+
+def _check_deps():
+    """Raise a helpful error if a required package is missing."""
+    if _MISSING_DEPS is not None:
+        missing = getattr(_MISSING_DEPS, "name", None) or str(_MISSING_DEPS)
+        raise RuntimeError(
+            f"Missing required package: {missing}.\n"
+            "Install the dependencies first:\n"
+            "    python -m pip install -r requirements.txt\n"
+            "If you ran this with the system python3, use a virtual "
+            "environment instead:\n"
+            "    python -m venv pdfvenv\n"
+            "    pdfvenv/bin/python -m pip install -r requirements.txt\n"
+            "    pdfvenv/bin/python pdf_compressor.py input.pdf output.pdf"
+        )
+
+
+try:
+    import fitz  # PyMuPDF — optional, enables the render check in --deep mode
+except ImportError:
+    fitz = None
+
+try:
+    from PIL import ImageChops
+except ImportError:  # pragma: no cover - Pillow always present with Image
+    ImageChops = None
+
+import vector_shorten
 
 
 def compression_percent_to_settings(percent):
@@ -376,7 +467,187 @@ def verify_page_count(input_path, output_path):
     return in_pages, out_pages
 
 
-def compress_file(
+# Render-check gate for --deep mode. On the proven Phase Two run the safe
+# shortening changed ~2-3% of pixels by >10 levels at 72 DPI (sub-pixel
+# anti-aliasing only), while the rejected "round everything to 2dp" run
+# changed ~20%. 8% sits well above the expected range and well below the
+# range that means real damage.
+RENDER_FAIL_THRESHOLD = 0.08
+RENDER_SAMPLE_PAGES = 5
+
+
+def _page_sizes(pdf):
+    """[(width, height, rotation), ...] for every page, via pikepdf."""
+    sizes = []
+    for page in pdf.pages:
+        box = page.get("/MediaBox")
+        width = float(box[2]) - float(box[0])
+        height = float(box[3]) - float(box[1])
+        sizes.append((width, height, int(page.get("/Rotate", 0))))
+    return sizes
+
+
+def _text_fingerprint_fitz(path):
+    """Per-page (word Counter, alphanumeric char count) using PyMuPDF."""
+    pages = []
+    with fitz.open(path) as doc:
+        for page in doc:
+            words = Counter(w[4] for w in page.get_text("words"))
+            text = page.get_text()
+            alnum = sum(1 for ch in text if ch.isalnum())
+            pages.append((words, alnum))
+    return pages
+
+
+def _text_fingerprint_tokens(path):
+    """Fallback text check without PyMuPDF: per-page Counter of the
+    literal-string and hex-string tokens in the content streams.
+
+    Deep mode copies strings verbatim, so these multisets must be
+    identical between input and output. (This checks that no text was
+    touched; it is not a full text extraction.)
+    """
+    pages = []
+    with pikepdf.open(path) as pdf:
+        for page in pdf.pages:
+            counter = Counter()
+            contents = page.get("/Contents")
+            if contents is not None:
+                streams = (
+                    list(contents)
+                    if isinstance(contents, pikepdf.Array)
+                    else [contents]
+                )
+                for stream in streams:
+                    try:
+                        data = stream.read_bytes()
+                    except Exception:
+                        continue
+                    for kind, tok in vector_shorten.tokens(data):
+                        if kind in ("string", "hex"):
+                            counter[tok] += 1
+            pages.append(counter)
+    return pages
+
+
+def _render_diff_fraction(input_path, output_path, page_index, dpi=72):
+    """Fraction of pixels differing by >10 (in any RGB channel) between
+    the same page rendered from both files. Returns None if rendering
+    is unavailable (PyMuPDF or Pillow missing)."""
+    if fitz is None or ImageChops is None:
+        return None
+    with fitz.open(input_path) as doc_in, fitz.open(output_path) as doc_out:
+        pix_in = doc_in[page_index].get_pixmap(dpi=dpi, alpha=False)
+        pix_out = doc_out[page_index].get_pixmap(dpi=dpi, alpha=False)
+    img_in = Image.frombytes("RGB", (pix_in.width, pix_in.height), pix_in.samples)
+    img_out = Image.frombytes("RGB", (pix_out.width, pix_out.height), pix_out.samples)
+    if img_in.size != img_out.size:
+        return 1.0  # page size changed: treat as total failure
+    diff = ImageChops.difference(img_in, img_out)
+    hist = diff.histogram()
+    total = img_in.width * img_in.height
+    worst = 0.0
+    for channel in range(3):
+        channel_hist = hist[channel * 256:(channel + 1) * 256]
+        worst = max(worst, sum(channel_hist[11:]) / total)
+    return worst
+
+
+def verify_output(input_path, output_path, verbose=True):
+    """Verify a compressed output against its input.
+
+    Checks, in order:
+    1. page count unchanged;
+    2. page sizes and rotations unchanged;
+    3. extracted text identical (per-page word multisets + alphanumeric
+       char count with PyMuPDF; string-token multisets without it);
+    4. render comparison on up to 5 evenly spaced pages at 72 DPI
+       (PyMuPDF only) — fails if more than RENDER_FAIL_THRESHOLD of
+       pixels differ by >10 levels in any channel.
+
+    Returns a dict with "ok" plus per-check results. "render_ok" is None
+    when the render check was skipped (PyMuPDF missing), in which case
+    the text and page checks still gate the result.
+    """
+    result = {
+        "ok": False,
+        "reason": "",
+        "pages_ok": False,
+        "sizes_ok": False,
+        "text_ok": False,
+        "text_method": None,
+        "render_ok": None,
+        "render_max_diff": None,
+        "render_pages_checked": 0,
+    }
+
+    in_pages, out_pages = verify_page_count(input_path, output_path)
+    result["pages_ok"] = in_pages == out_pages
+    if not result["pages_ok"]:
+        result["reason"] = f"page count changed {in_pages} -> {out_pages}"
+        return result
+
+    with pikepdf.open(input_path) as src, pikepdf.open(output_path) as dst:
+        result["sizes_ok"] = _page_sizes(src) == _page_sizes(dst)
+    if not result["sizes_ok"]:
+        result["reason"] = "page size or rotation changed"
+        return result
+
+    if fitz is not None:
+        result["text_method"] = "PyMuPDF word multisets"
+        in_text = _text_fingerprint_fitz(input_path)
+        out_text = _text_fingerprint_fitz(output_path)
+    else:
+        result["text_method"] = "content-stream string tokens (PyMuPDF not installed)"
+        in_text = _text_fingerprint_tokens(input_path)
+        out_text = _text_fingerprint_tokens(output_path)
+        if verbose:
+            print(
+                "  Note: PyMuPDF not installed — text check uses content-stream "
+                "string tokens, render check skipped. "
+                "Install PyMuPDF for the full check: pip install PyMuPDF",
+                flush=True,
+            )
+    result["text_ok"] = in_text == out_text
+    if not result["text_ok"]:
+        result["reason"] = "extracted text differs"
+        return result
+
+    if fitz is not None and ImageChops is not None:
+        n = in_pages
+        if n <= RENDER_SAMPLE_PAGES:
+            sample = list(range(n))
+        else:
+            sample = sorted(
+                {0, n // 4, n // 2, (3 * n) // 4, n - 1}
+            )
+        worst = 0.0
+        for idx in sample:
+            frac = _render_diff_fraction(input_path, output_path, idx)
+            if frac is None:
+                break
+            worst = max(worst, frac)
+            if verbose:
+                print(
+                    f"  Render check page {idx + 1}/{n}: "
+                    f"{frac * 100:.2f}% pixels differ >10",
+                    flush=True,
+                )
+        result["render_max_diff"] = worst
+        result["render_pages_checked"] = len(sample)
+        result["render_ok"] = worst <= RENDER_FAIL_THRESHOLD
+        if not result["render_ok"]:
+            result["reason"] = (
+                f"render differs too much "
+                f"({worst * 100:.2f}% pixels > {RENDER_FAIL_THRESHOLD * 100:.0f}% limit)"
+            )
+            return result
+
+    result["ok"] = True
+    return result
+
+
+def _run_pipeline(
     input_path,
     output_path,
     image_scale=0.5,
@@ -385,25 +656,20 @@ def compress_file(
     downscale_enabled=True,
     keep_vp=False,
     zopfli_iterations=5,
+    deep=False,
     verbose=True,
+    label="",
 ):
-    """Run all compression steps. Returns a dict of stats.
+    """One full compression pass: open, downscale, VP removal, optional
+    deep vector shortening, Zopfli, save. Returns a stats dict.
 
-    Raises FileNotFoundError / ValueError for bad inputs, and propagates
-    pikepdf errors. On success, output_path exists and page counts match
-    (checked by the caller via verify_page_count if desired).
-    The output is never bigger than the input: if compression would grow
-    the file, the original is copied to output_path instead and the
-    returned dict has kept_original=True with 0% reduction.
+    This does NOT apply the never-bigger fallback — the caller decides
+    what to do with the result (deep mode needs both the lossless and
+    the deep candidate before choosing).
     """
-    if not os.path.isfile(input_path):
-        raise FileNotFoundError(f"Input file not found: {input_path}")
-    if os.path.abspath(input_path) == os.path.abspath(output_path):
-        raise ValueError("Output must be a different file from input.")
-
+    if label:
+        print(f"{label}", flush=True)
     original_size = os.path.getsize(input_path)
-    print(f"Original: {original_size} bytes", flush=True)
-
     pdf = pikepdf.open(input_path)
 
     if downscale_enabled:
@@ -425,6 +691,16 @@ def compress_file(
         remove_nonvisible_data(pdf)
     else:
         print("Step 2: Skipped (keeping VP data)", flush=True)
+
+    deep_stats = {"streams_changed": 0, "streams_skipped_bi": 0,
+                  "decoded_bytes_trimmed": 0}
+    if deep:
+        print(
+            "Step 2b: Deep vector shortening "
+            "(safe number rounding, see vector_shorten.py)...",
+            flush=True,
+        )
+        deep_stats = vector_shorten.shorten_content_streams(pdf, verbose=verbose)
 
     print(
         "Step 3: Zopfli-compressing Flate streams "
@@ -451,36 +727,13 @@ def compress_file(
     pdf.close()
 
     new_size = os.path.getsize(output_path)
-    # Never-bigger fallback: if compression grew the file, return the
-    # original instead. The caller (and the batch summary) then reports
-    # 0% reduction for this file, never a negative one.
-    kept_original = False
-    if new_size >= original_size:
-        shutil.copyfile(input_path, output_path)
-        new_size = original_size
-        kept_original = True
-        print(
-            "Kept original (compressed version was not smaller)",
-            flush=True,
-        )
-    reduction = (1 - new_size / original_size) * 100 if original_size else 0
-    print(f"Done! Output: {output_path}", flush=True)
-    print(f"Original: {original_size} bytes", flush=True)
-    print(f"New: {new_size} bytes", flush=True)
-    print(f"Reduction: {reduction:.2f}%", flush=True)
-    print(f"Saved: {original_size - new_size} bytes", flush=True)
-
     in_pages, out_pages = verify_page_count(input_path, output_path)
-    print(
-        f"Pages: {in_pages} -> {out_pages} "
-        f"({'OK' if in_pages == out_pages else 'MISMATCH!'})",
-        flush=True,
-    )
-
-    return {
+    stats = {
         "original_size": original_size,
         "new_size": new_size,
-        "reduction_percent": reduction,
+        "reduction_percent": (
+            (1 - new_size / original_size) * 100 if original_size else 0
+        ),
         "saved_bytes": original_size - new_size,
         "in_pages": in_pages,
         "out_pages": out_pages,
@@ -488,8 +741,196 @@ def compress_file(
         "image_saved": saved,
         "stream_count": stream_count,
         "zopfli_saved": zopfli_saved,
-        "kept_original": kept_original,
+        "deep": deep,
+        "deep_streams_changed": deep_stats["streams_changed"],
+        "deep_streams_skipped_bi": deep_stats["streams_skipped_bi"],
+        "deep_decoded_bytes_trimmed": deep_stats["decoded_bytes_trimmed"],
+        "kept_original": False,
     }
+    return stats
+
+
+def _never_bigger(input_path, output_path, stats, verbose=True):
+    """Never-bigger fallback: if the output grew, copy the original
+    instead and adjust the stats. Returns the (possibly updated) stats."""
+    if stats["new_size"] >= stats["original_size"]:
+        shutil.copyfile(input_path, output_path)
+        stats = dict(stats)
+        stats["new_size"] = stats["original_size"]
+        stats["reduction_percent"] = 0.0
+        stats["saved_bytes"] = 0
+        stats["kept_original"] = True
+        if verbose:
+            print(
+                "Kept original (compressed version was not smaller)",
+                flush=True,
+            )
+    return stats
+
+
+def compress_file(
+    input_path,
+    output_path,
+    image_scale=0.5,
+    image_quality=50,
+    min_image_pixels=50000,
+    downscale_enabled=True,
+    keep_vp=False,
+    zopfli_iterations=5,
+    deep=False,
+    verbose=True,
+):
+    """Run all compression steps. Returns a dict of stats.
+
+    Raises FileNotFoundError / ValueError for bad inputs, and propagates
+    pikepdf errors. On success, output_path exists and page counts match
+    (checked by the caller via verify_page_count if desired).
+    The output is never bigger than the input: if compression would grow
+    the file, the original is copied to output_path instead and the
+    returned dict has kept_original=True with 0% reduction.
+
+    deep=True runs the opt-in "deep" mode: the pipeline is run twice
+    (once lossless, once with safe vector-number shortening), the deep
+    candidate is verified against the input (page count, page sizes,
+    extracted text, render comparison), and the deep result is kept
+    only if verification passes AND it is smaller than the lossless
+    result. Otherwise the lossless result is delivered instead and the
+    returned dict has deep_fallback=True with the reason. See
+    vector_shorten.py for the exact shortening rules.
+    """
+    _check_deps()
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+    if os.path.abspath(input_path) == os.path.abspath(output_path):
+        raise ValueError("Output must be a different file from input.")
+
+    original_size = os.path.getsize(input_path)
+    print(f"Original: {original_size} bytes", flush=True)
+
+    if not deep:
+        stats = _run_pipeline(
+            input_path,
+            output_path,
+            image_scale=image_scale,
+            image_quality=image_quality,
+            min_image_pixels=min_image_pixels,
+            downscale_enabled=downscale_enabled,
+            keep_vp=keep_vp,
+            zopfli_iterations=zopfli_iterations,
+            deep=False,
+            verbose=verbose,
+        )
+        stats["deep_fallback"] = False
+        stats["deep_fallback_reason"] = ""
+        stats["deep_verification"] = None
+        stats = _never_bigger(input_path, output_path, stats, verbose=verbose)
+    else:
+        print(
+            "Deep mode ON: building both a lossless and a deep candidate, "
+            "then verifying the deep one (this is slow — about twice the "
+            "lossless time).",
+            flush=True,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lossless_path = os.path.join(tmpdir, "lossless.pdf")
+            lossless = _run_pipeline(
+                input_path,
+                lossless_path,
+                image_scale=image_scale,
+                image_quality=image_quality,
+                min_image_pixels=min_image_pixels,
+                downscale_enabled=downscale_enabled,
+                keep_vp=keep_vp,
+                zopfli_iterations=zopfli_iterations,
+                deep=False,
+                verbose=verbose,
+                label="Pass 1/2 (lossless candidate):",
+            )
+            print(
+                f"Lossless candidate: {lossless['new_size']} bytes",
+                flush=True,
+            )
+            deep_stats = _run_pipeline(
+                input_path,
+                output_path,
+                image_scale=image_scale,
+                image_quality=image_quality,
+                min_image_pixels=min_image_pixels,
+                downscale_enabled=downscale_enabled,
+                keep_vp=keep_vp,
+                zopfli_iterations=zopfli_iterations,
+                deep=True,
+                verbose=verbose,
+                label="Pass 2/2 (deep candidate):",
+            )
+            print(
+                f"Deep candidate: {deep_stats['new_size']} bytes",
+                flush=True,
+            )
+            print("Verifying deep candidate against the original...", flush=True)
+            verification = verify_output(input_path, output_path, verbose=verbose)
+            fallback_reason = ""
+            if not verification["ok"]:
+                fallback_reason = (
+                    f"deep verification failed: {verification['reason']}"
+                )
+            elif deep_stats["new_size"] >= lossless["new_size"]:
+                fallback_reason = (
+                    f"deep result ({deep_stats['new_size']} bytes) not smaller "
+                    f"than lossless ({lossless['new_size']} bytes)"
+                )
+            if fallback_reason:
+                print(
+                    f"Deep mode fell back to lossless: {fallback_reason}",
+                    flush=True,
+                )
+                shutil.copyfile(lossless_path, output_path)
+                stats = dict(lossless)
+                stats["deep"] = True
+                stats["deep_fallback"] = True
+                stats["deep_fallback_reason"] = fallback_reason
+                stats["deep_verification"] = verification
+                stats["lossless_size"] = lossless["new_size"]
+            else:
+                print(
+                    "Deep verification passed "
+                    f"(text: {verification['text_method']}; "
+                    + (
+                        f"render max diff "
+                        f"{verification['render_max_diff'] * 100:.2f}% on "
+                        f"{verification['render_pages_checked']} page(s)"
+                        if verification["render_max_diff"] is not None
+                        else "render check skipped (PyMuPDF not installed)"
+                    )
+                    + "). Keeping deep result.",
+                    flush=True,
+                )
+                stats = dict(deep_stats)
+                stats["deep_fallback"] = False
+                stats["deep_fallback_reason"] = ""
+                stats["deep_verification"] = verification
+                stats["lossless_size"] = lossless["new_size"]
+        stats = _never_bigger(input_path, output_path, stats, verbose=verbose)
+
+    print(f"Done! Output: {output_path}", flush=True)
+    print(f"Original: {stats['original_size']} bytes", flush=True)
+    print(f"New: {stats['new_size']} bytes", flush=True)
+    print(f"Reduction: {stats['reduction_percent']:.2f}%", flush=True)
+    print(f"Saved: {stats['saved_bytes']} bytes", flush=True)
+
+    print(
+        f"Pages: {stats['in_pages']} -> {stats['out_pages']} "
+        f"({'OK' if stats['in_pages'] == stats['out_pages'] else 'MISMATCH!'})",
+        flush=True,
+    )
+    if stats.get("deep_fallback"):
+        print(
+            f"Deep mode: fell back to lossless "
+            f"({stats['deep_fallback_reason']})",
+            flush=True,
+        )
+
+    return stats
 
 
 def compress_batch(
@@ -501,6 +942,7 @@ def compress_batch(
     downscale_enabled=True,
     keep_vp=False,
     zopfli_iterations=5,
+    deep=False,
     verbose=True,
 ):
     """Compress several PDFs and pack the results into one zip file.
@@ -520,6 +962,7 @@ def compress_batch(
     """
     if not input_paths:
         raise ValueError("No input files given for batch mode.")
+    _check_deps()
 
     # Deduplicate output names inside the zip.
     used_names = set()
@@ -552,6 +995,7 @@ def compress_batch(
                     downscale_enabled=downscale_enabled,
                     keep_vp=keep_vp,
                     zopfli_iterations=zopfli_iterations,
+                    deep=deep,
                     verbose=verbose,
                 )
             except Exception as exc:
@@ -584,7 +1028,12 @@ def compress_batch(
                 f"RESULT {input_path}: {stats['original_size']} -> "
                 f"{stats['new_size']} ({stats['reduction_percent']:.2f}%), "
                 f"pages {stats['in_pages']} -> {stats['out_pages']}, "
-                f"kept_original={stats['kept_original']}",
+                f"kept_original={stats['kept_original']}"
+                + (
+                    f", deep_fallback ({stats['deep_fallback_reason']})"
+                    if stats.get("deep_fallback")
+                    else ""
+                ),
                 flush=True,
             )
         zip_size = 0
@@ -687,6 +1136,17 @@ def main(argv=None):
         help="Keep /VP measurement viewports (default: remove them)",
     )
     parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="Deep vector mode (opt-in, slow): safely shorten numbers in "
+        "vector drawing instructions (coordinates to 1 decimal, colours "
+        "to 2 decimals, exact 0.479969 -> 0.48 scale only), then verify "
+        "the result (page count, page sizes, extracted text, render "
+        "comparison) and fall back to the lossless result if verification "
+        "fails or the deep result is not smaller. Best for vector-heavy "
+        "engineering PDFs; does nothing extra for scanned/image PDFs.",
+    )
+    parser.add_argument(
         "--zopfli-iterations",
         type=int,
         default=5,
@@ -700,6 +1160,12 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     verbose = not args.quiet
+
+    try:
+        _check_deps()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
 
     # Slider mapping takes precedence over manual scale/quality.
     downscale_enabled = not args.no_image_downscale
@@ -727,6 +1193,7 @@ def main(argv=None):
                 downscale_enabled=downscale_enabled,
                 keep_vp=args.keep_vp,
                 zopfli_iterations=args.zopfli_iterations,
+                deep=args.deep,
                 verbose=verbose,
             )
         except (OSError, ValueError) as exc:
@@ -761,12 +1228,16 @@ def main(argv=None):
             downscale_enabled=downscale_enabled,
             keep_vp=args.keep_vp,
             zopfli_iterations=args.zopfli_iterations,
+            deep=args.deep,
             verbose=verbose,
         )
     except FileNotFoundError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
     except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
